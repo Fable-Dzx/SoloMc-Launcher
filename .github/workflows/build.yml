@@ -1,38 +1,114 @@
-# SoloMC 三平台构建
-#
-# - 触发：push tag v*（发布）、push main（校验）、手动 dispatch
-# - 平台矩阵：Windows / macOS(universal) / Linux，全部由官方 tauri-action 构建
-# - 图标由 scripts/gen_icon.py 生成源图，再用 tauri icon 生成全套（.ico/.icns/png）
-
 name: build
 
 on:
   push:
-    tags:
-      - "v*"
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      bump:
+        description: "版本递增类型"
+        required: true
+        default: "patch"
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
 
 permissions:
   contents: write
 
-# 同一 ref 的重复触发串行化：main/手动触发取消旧 run 释放槽位；
-# tag 发布不取消，避免发布到一半被中断
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+  cancel-in-progress: true
 
 jobs:
+  # ── 1. 计算版本并创建草稿 Release ─────────────────────────────
+  create-release:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.new_version }}
+      release_id: ${{ steps.release.outputs.release_id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # 必须拉取完整 tag 历史
+
+      - name: 计算下一个版本号（满 10 进 1）
+        id: version
+        shell: bash
+        run: |
+          LATEST_TAG=$(git tag -l 'v*' --sort=-v:refname | head -n1)
+          if [ -z "$LATEST_TAG" ]; then
+            NEW_VERSION="1.0.0"
+            echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+            echo "首次发布，版本: $NEW_VERSION"
+            exit 0
+          fi
+
+          IFS='.' read -r MAJOR MINOR PATCH <<< "${LATEST_TAG#v}"
+          # 强制十进制，避免 08/09 被当作八进制；缺位补 0
+          MAJOR=$((10#${MAJOR:-0}))
+          MINOR=$((10#${MINOR:-0}))
+          PATCH=$((10#${PATCH:-0}))
+
+          BUMP="${{ github.event.inputs.bump || 'patch' }}"
+          case "$BUMP" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            *)     PATCH=$((PATCH + 1)) ;;
+          esac
+
+          # 满 10 进 1：patch → minor → major
+          if [ "$PATCH" -ge 10 ]; then
+            PATCH=$((PATCH - 10))
+            MINOR=$((MINOR + 1))
+          fi
+          if [ "$MINOR" -ge 10 ]; then
+            MINOR=$((MINOR - 10))
+            MAJOR=$((MAJOR + 1))
+          fi
+
+          NEW_VERSION="$MAJOR.$MINOR.$PATCH"
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "上一个 tag: $LATEST_TAG → 下一个版本: $NEW_VERSION"
+
+      - name: 创建草稿 Release
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v${{ steps.version.outputs.new_version }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，直接复用"
+          else
+            NOTES=$(cat <<'EOF'
+          去中心化 Minecraft 启动器
+
+          ## 特性
+          - 从 Mojang 官方获取并安装游戏版本，可调并发多线程下载
+          - 可选安装 Fabric / Forge / NeoForge 加载器
+          - Modrinth 模组搜索 / 安装 / required 依赖自动补全
+          - 版本隔离：每个实例独立目录
+          - 离线账号为主，可选微软正版登录（设备码流程）
+          - Windows / macOS / Linux 全平台
+          EOF
+          )
+            gh release create "$TAG" --draft --title "SoloMC $TAG" --notes "$NOTES"
+          fi
+
+          RELEASE_ID=$(gh release view "$TAG" --json databaseId -q .databaseId)
+          echo "release_id=$RELEASE_ID" >> $GITHUB_OUTPUT
+
+  # ── 2. 三平台构建，通过 releaseId 并行上传 ───────────────────
   build:
     name: build (${{ matrix.name }})
+    needs: create-release
     strategy:
       fail-fast: false
       matrix:
         include:
-          # macOS 合并为一个 universal 构建：只占 1 个 macOS 并发槽位，
-          # 产物同时支持 arm64 + x64，降低 arm64 runner 排队概率。
-          # 代价：dmg 体积约为单架构的 2 倍，构建时间也更长。
           - platform: macos-latest
             name: macos-universal
             args: --target universal-apple-darwin
@@ -46,13 +122,11 @@ jobs:
     runs-on: ${{ matrix.platform }}
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Rust 工具链
         uses: dtolnay/rust-toolchain@stable
         with:
-          # universal 需要同时安装两个 target，由 rustc 分别编译后 lipo 合并
           targets: ${{ startsWith(matrix.name, 'macos') && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - name: Rust 缓存
@@ -61,20 +135,16 @@ jobs:
           workspaces: "./src-tauri -> target"
           key: ${{ matrix.name }}
 
-      - name: Node 22
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
 
-      # Windows 上没有 python3，统一用 setup-python 提供 python
-      - name: Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
 
-      - name: 安装前端依赖
-        run: npm ci
+      - run: npm ci
 
       - name: Linux 系统依赖
         if: matrix.platform == 'ubuntu-22.04'
@@ -90,53 +160,23 @@ jobs:
           python scripts/gen_icon.py
           npx tauri icon src-tauri/icons/icon.png
 
-      # 校验 tag 与 tauri.conf.json 版本一致，避免 tauri-action 找错/新建 tag
-      - name: 校验 tag 与版本一致
-        if: startsWith(github.ref, 'refs/tags/v')
-        shell: bash
-        run: |
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-          CONF_VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
-          if [ "$TAG_VERSION" != "$CONF_VERSION" ]; then
-            echo "::error::tag v$TAG_VERSION 与 tauri.conf.json 版本 $CONF_VERSION 不一致"
-            exit 1
-          fi
-
-      # 注意：如果 tauri.conf.json 的 build.beforeBuildCommand 也是 npm run build，
-      # 这里会重复构建一次。可删除本步、交给 tauri-action 执行。
-      - name: 前端构建
-        run: npm run build
-
-      - name: Tauri 构建 (${{ matrix.name }})
+      - name: Tauri 构建并上传资产
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          # 仅当推送 v* tag 时创建/更新 Release；main 与手动触发只出构建产物
-          tagName: ${{ startsWith(github.ref, 'refs/tags/v') && 'v__VERSION__' || '' }}
-          releaseName: ${{ startsWith(github.ref, 'refs/tags/v') && 'SoloMC v__VERSION__' || '' }}
-          releaseBody: |
-            去中心化 Minecraft 启动器
-
-            ## 特性
-            - 从 Mojang 官方获取并安装游戏版本，可调并发多线程下载
-            - 可选安装 Fabric / Forge / NeoForge 加载器
-            - Modrinth 模组搜索 / 安装 / required 依赖自动补全
-            - 版本隔离：每个实例独立目录
-            - 离线账号为主，可选微软正版登录（设备码流程）
-            - Windows / macOS / Linux 全平台
-          releaseDraft: true
-          prerelease: false
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          appVersion: ${{ needs.create-release.outputs.version }}
           args: ${{ matrix.args }}
 
-      # 非 tag 触发时，tauri-action 不会创建 Release，产物会随 job 结束丢失，
-      # 这里显式上传为 workflow artifact
-      - name: 上传构建产物
-        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: solomc-${{ matrix.name }}
-          if-no-files-found: error
-          path: |
-            src-tauri/target/release/bundle/**
-            src-tauri/target/*/release/bundle/**
+  # ── 3. 全部平台成功后，自动发布草稿 ──────────────────────────
+  publish:
+    name: publish release
+    needs: [create-release, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: 将草稿转为正式 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release edit "v${{ needs.create-release.outputs.version }}" --draft=false
