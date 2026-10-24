@@ -1,7 +1,7 @@
 # SoloMC 三平台构建
 #
 # - 触发：push tag v*（发布）、push main（校验）、手动 dispatch
-# - 平台矩阵：Windows / macOS / Linux，全部由官方 tauri-action 构建并上传产物
+# - 平台矩阵：Windows / macOS(arm64+x64) / Linux，全部由官方 tauri-action 构建
 # - 图标由 scripts/gen_icon.py 生成源图，再用 tauri icon 生成全套（.ico/.icns/png）
 
 name: build
@@ -17,19 +17,31 @@ on:
 permissions:
   contents: write
 
+# 同一 ref 的重复触发串行化；tag 发布不取消进行中的构建
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+
 jobs:
   build:
+    name: build (${{ matrix.name }})
     strategy:
       fail-fast: false
       matrix:
         include:
+          # macOS arm64：macos-latest 即 arm64 runner
           - platform: macos-latest
+            name: macos-arm64
             args: --target aarch64-apple-darwin
-          - platform: macos-latest
+          # macOS x64：用 x86_64 runner 原生构建，避免交叉编译踩坑
+          - platform: macos-13
+            name: macos-x64
             args: --target x86_64-apple-darwin
           - platform: ubuntu-22.04
+            name: linux-x64
             args: ""
           - platform: windows-latest
+            name: windows-x64
             args: ""
 
     runs-on: ${{ matrix.platform }}
@@ -41,18 +53,26 @@ jobs:
       - name: Rust 工具链
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          targets: ${{ startsWith(matrix.name, 'macos') && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - name: Rust 缓存
         uses: swatinem/rust-cache@v2
         with:
           workspaces: "./src-tauri -> target"
+          # 关键：两个 macOS job 必须区分缓存 key，否则互相覆盖
+          key: ${{ matrix.name }}
 
       - name: Node 22
         uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
+
+      # Windows 上没有 python3，统一用 setup-python 提供 python
+      - name: Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
 
       - name: 安装前端依赖
         run: npm ci
@@ -67,13 +87,28 @@ jobs:
 
       - name: 生成并转换图标
         run: |
-          python3 scripts/gen_icon.py
+          python -m pip install --upgrade pillow
+          python scripts/gen_icon.py
           npx tauri icon src-tauri/icons/icon.png
 
+      # 校验 tag 与 tauri.conf.json 版本一致，避免 tauri-action 找错/新建 tag
+      - name: 校验 tag 与版本一致
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CONF_VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          if [ "$TAG_VERSION" != "$CONF_VERSION" ]; then
+            echo "::error::tag v$TAG_VERSION 与 tauri.conf.json 版本 $CONF_VERSION 不一致"
+            exit 1
+          fi
+
+      # 注意：如果 tauri.conf.json 的 build.beforeBuildCommand 也是 npm run build，
+      # 这里会重复构建一次。可删除本步、交给 tauri-action 执行。
       - name: 前端构建
         run: npm run build
 
-      - name: Tauri 构建 (${{ matrix.platform }})
+      - name: Tauri 构建 (${{ matrix.name }})
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -94,3 +129,15 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+
+      # 非 tag 触发时，tauri-action 不会创建 Release，产物会随 job 结束丢失，
+      # 这里显式上传为 workflow artifact
+      - name: 上传构建产物
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: solomc-${{ matrix.name }}
+          if-no-files-found: error
+          path: |
+            src-tauri/target/release/bundle/**
+            src-tauri/target/*/release/bundle/**
