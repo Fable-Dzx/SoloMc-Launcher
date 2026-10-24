@@ -1,0 +1,37 @@
+[package]
+name = "solo-mc"
+version = "0.1.0"
+description = "SoloMC — 去中心化 Minecraft 启动器"
+authors = ["SoloMC Contributors"]
+edition = "2021"
+
+[lib]
+name = "solo_mc_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2"] }
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+sha1 = "0.10"
+md5 = "0.7"
+dirs = "5"
+thiserror = "2"
+url = "2"
+log = "0.4"
+env_logger = "0.11"
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

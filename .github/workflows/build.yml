@@ -1,0 +1,96 @@
+# SoloMC 三平台构建
+#
+# - 触发：push tag v*（发布）、push main（校验）、手动 dispatch
+# - 平台矩阵：Windows / macOS / Linux，全部由官方 tauri-action 构建并上传产物
+# - 图标由 scripts/gen_icon.py 生成源图，再用 tauri icon 生成全套（.ico/.icns/png）
+
+name: build
+
+on:
+  push:
+    tags:
+      - "v*"
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: --target aarch64-apple-darwin
+          - platform: macos-latest
+            args: --target x86_64-apple-darwin
+          - platform: ubuntu-22.04
+            args: ""
+          - platform: windows-latest
+            args: ""
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Rust 缓存
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: 安装前端依赖
+        run: npm ci
+
+      - name: Linux 系统依赖
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libsoup-3.0-dev libjavascriptcoregtk-4.1-dev librsvg2-dev \
+            libayatana-appindicator3-dev patchelf
+
+      - name: 生成并转换图标
+        run: |
+          python3 scripts/gen_icon.py
+          npx tauri icon src-tauri/icons/icon.png
+
+      - name: 前端构建
+        run: npm run build
+
+      - name: Tauri 构建 (${{ matrix.platform }})
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # 仅当推送 v* tag 时创建/更新 Release；main 与手动触发只出构建产物
+          tagName: ${{ startsWith(github.ref, 'refs/tags/v') && 'v__VERSION__' || '' }}
+          releaseName: ${{ startsWith(github.ref, 'refs/tags/v') && 'SoloMC v__VERSION__' || '' }}
+          releaseBody: |
+            去中心化 Minecraft 启动器
+
+            ## 特性
+            - 从 Mojang 官方获取并安装游戏版本，可调并发多线程下载
+            - 可选安装 Fabric / Forge / NeoForge 加载器
+            - Modrinth 模组搜索 / 安装 / required 依赖自动补全
+            - 版本隔离：每个实例独立目录
+            - 离线账号为主，可选微软正版登录（设备码流程）
+            - Windows / macOS / Linux 全平台
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
