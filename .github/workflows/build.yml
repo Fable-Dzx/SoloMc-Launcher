@@ -80,25 +80,16 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="v${{ steps.version.outputs.new_version }}"
-          if gh release view "$TAG" >/dev/null 2>&1; then
+          REPO="${{ github.repository }}"
+
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
             echo "Release $TAG 已存在，直接复用"
           else
-            NOTES=$(cat <<'EOF'
-          去中心化 Minecraft 启动器
-
-          ## 特性
-          - 从 Mojang 官方获取并安装游戏版本，可调并发多线程下载
-          - 可选安装 Fabric / Forge / NeoForge 加载器
-          - Modrinth 模组搜索 / 安装 / required 依赖自动补全
-          - 版本隔离：每个实例独立目录
-          - 离线账号为主，可选微软正版登录（设备码流程）
-          - Windows / macOS / Linux 全平台
-          EOF
-          )
-            gh release create "$TAG" --draft --title "SoloMC $TAG" --notes "$NOTES"
+            NOTES=$'去中心化 Minecraft 启动器\n\n## 特性\n- 从 Mojang 官方获取并安装游戏版本，可调并发多线程下载\n- 可选安装 Fabric / Forge / NeoForge 加载器\n- Modrinth 模组搜索 / 安装 / required 依赖自动补全\n- 版本隔离：每个实例独立目录\n- 离线账号为主，可选微软正版登录（设备码流程）\n- Windows / macOS / Linux 全平台'
+            gh release create "$TAG" --repo "$REPO" --draft --title "SoloMC $TAG" --notes "$NOTES"
           fi
 
-          RELEASE_ID=$(gh release view "$TAG" --json databaseId -q .databaseId)
+          RELEASE_ID=$(gh release view "$TAG" --repo "$REPO" --json databaseId -q .databaseId)
           echo "release_id=$RELEASE_ID" >> $GITHUB_OUTPUT
 
   # ── 2. 三平台构建，通过 releaseId 并行上传 ───────────────────
@@ -160,16 +151,23 @@ jobs:
           python scripts/gen_icon.py
           npx tauri icon src-tauri/icons/icon.png
 
+      # 注意：如果 tauri.conf.json 的 build.beforeBuildCommand 也是 npm run build，
+      # 这里会重复构建一次。可删除本步、交给 tauri-action 执行。
+      - name: 前端构建
+        run: npm run build
+
       - name: Tauri 构建并上传资产
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
+          # 显式指定 releaseId：三个平台都上传到同一个草稿 Release
           releaseId: ${{ needs.create-release.outputs.release_id }}
+          # 注入计算出的版本号，保证二进制内版本与 tag 一致
           appVersion: ${{ needs.create-release.outputs.version }}
           args: ${{ matrix.args }}
 
-  # ── 3. 全部平台成功后，自动发布草稿 ──────────────────────────
+  # ── 3. 全部平台成功后，自动把草稿转为正式发布 ────────────────
   publish:
     name: publish release
     needs: [create-release, build]
@@ -179,4 +177,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release edit "v${{ needs.create-release.outputs.version }}" --draft=false
+          gh release edit "v${{ needs.create-release.outputs.version }}" \
+            --repo "${{ github.repository }}" \
+            --draft=false
